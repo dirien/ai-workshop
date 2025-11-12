@@ -287,6 +287,207 @@ Provide a helpful, accurate response based on the context above. think deeply an
     return Array.from(sources);
   }
 
+  async generateResponseStream(question, providerName = null, maxContextDocs = 5) {
+    return tracer.startActiveSpan('rag.generate_response_stream', async (span) => {
+      try {
+        logger.info(`Generating streaming response for question: "${question}"`);
+
+        // Add question metadata to span
+        span.setAttributes({
+          'rag.question': question,
+          'rag.question_length': question.length,
+          'rag.provider': providerName || 'default',
+          'rag.max_context_docs': maxContextDocs,
+          'rag.streaming': true
+        });
+
+        // Vector search with tracing
+        const relevantDocs = await tracer.startActiveSpan('rag.vector_search', async (vectorSpan) => {
+          const vectorStartTime = Date.now();
+
+          try {
+            const results = await vectorStore.similaritySearchWithScore(question, maxContextDocs);
+            const duration = Date.now() - vectorStartTime;
+
+            // Calculate relevance scores
+            const scores = results.map(([, score]) => score);
+            const avgScore = scores.reduce((a, b) => a + b, 0) / scores.length;
+
+            vectorSpan.setAttributes({
+              'rag.vector_search.duration_ms': duration,
+              'rag.vector_search.results_count': results.length,
+              'rag.vector_search.max_score': Math.max(...scores),
+              'rag.vector_search.min_score': Math.min(...scores),
+              'rag.vector_search.avg_score': avgScore
+            });
+
+            vectorSpan.setStatus({ code: SpanStatusCode.OK });
+            vectorSpan.end();
+            return results;
+          } catch (error) {
+            vectorSpan.setStatus({
+              code: SpanStatusCode.ERROR,
+              message: error.message
+            });
+            vectorSpan.recordException(error);
+            vectorSpan.end();
+            throw error;
+          }
+        });
+
+        // Format context with tracing
+        const formattedContext = await tracer.startActiveSpan('rag.format_context', async (formatSpan) => {
+          try {
+            const context = this.formatContext(relevantDocs);
+
+            formatSpan.setAttributes({
+              'rag.context.formatted_length': context.length,
+              'rag.context.documents_used': relevantDocs.length,
+              'rag.context.sources': this.extractSources(relevantDocs).join(', ')
+            });
+
+            formatSpan.setStatus({ code: SpanStatusCode.OK });
+            formatSpan.end();
+            return context;
+          } catch (error) {
+            formatSpan.setStatus({
+              code: SpanStatusCode.ERROR,
+              message: error.message
+            });
+            formatSpan.recordException(error);
+            formatSpan.end();
+            throw error;
+          }
+        });
+
+        // Get LLM provider
+        const llm = llmProvider.getProvider(providerName);
+        const actualProvider = providerName || llmProvider.getAvailableProviders()[0];
+
+        // Create the streaming chain
+        const chain = this.promptTemplate
+          .pipe(llm)
+          .pipe(new StringOutputParser());
+
+        // Return stream generator with metadata
+        const streamGenerator = async function* () {
+          const llmStartTime = Date.now();
+          let totalChunks = 0;
+          let totalLength = 0;
+          let streamError = null;
+
+          try {
+            // Start LLM span
+            const llmSpan = tracer.startSpan('rag.llm_generation_stream', {
+              attributes: {
+                'rag.llm.provider': actualProvider,
+                'rag.llm.context_length': formattedContext.length,
+                'rag.llm.streaming': true
+              }
+            });
+
+            // Stream the response
+            const stream = await chain.stream({
+              context: formattedContext,
+              question: question
+            });
+
+            for await (const chunk of stream) {
+              totalChunks++;
+              totalLength += chunk.length;
+              
+              // Add streaming metrics
+              llmSpan.addEvent('rag.llm.chunk_received', {
+                'rag.llm.chunk_number': totalChunks,
+                'rag.llm.chunk_length': chunk.length,
+                'rag.llm.total_length': totalLength
+              });
+
+              yield chunk;
+            }
+
+            const duration = Date.now() - llmStartTime;
+
+            // Update span with final metrics
+            llmSpan.setAttributes({
+              'rag.llm.duration_ms': duration,
+              'rag.llm.total_chunks': totalChunks,
+              'rag.llm.response_length': totalLength,
+              'rag.llm.success': true
+            });
+
+            llmSpan.setStatus({ code: SpanStatusCode.OK });
+            llmSpan.end();
+
+          } catch (error) {
+            streamError = error;
+            const duration = Date.now() - llmStartTime;
+
+            const llmSpan = tracer.startSpan('rag.llm_generation_stream', {
+              attributes: {
+                'rag.llm.provider': actualProvider,
+                'rag.llm.duration_ms': duration,
+                'rag.llm.total_chunks': totalChunks,
+                'rag.llm.success': false,
+                'rag.llm.error': error.message
+              }
+            });
+
+            llmSpan.setStatus({
+              code: SpanStatusCode.ERROR,
+              message: error.message
+            });
+            llmSpan.recordException(error);
+            llmSpan.end();
+
+            throw error;
+          }
+        };
+
+        // Add metadata to span
+        span.setAttributes({
+          'rag.documents_used': relevantDocs.length,
+          'rag.success': true
+        });
+
+        span.setStatus({ code: SpanStatusCode.OK });
+        span.end();
+
+        // Return stream generator with metadata
+        return {
+          stream: streamGenerator(),
+          metadata: {
+            documentsUsed: relevantDocs.length,
+            sources: this.extractSources(relevantDocs),
+            relevanceScores: relevantDocs.map(([doc, score]) => ({
+              source: doc.metadata?.source || 'unknown',
+              score: score
+            })),
+            provider: actualProvider,
+            timestamp: new Date().toISOString()
+          }
+        };
+
+      } catch (error) {
+        logger.error('Error generating streaming RAG response:', error);
+
+        span.setAttributes({
+          'rag.success': false,
+          'rag.error': error.message
+        });
+
+        span.setStatus({
+          code: SpanStatusCode.ERROR,
+          message: error.message
+        });
+        span.recordException(error);
+        span.end();
+
+        throw error;
+      }
+    });
+  }
+
   async askQuestion(question, options = {}) {
     const {
       provider = null,
@@ -313,6 +514,20 @@ Provide a helpful, accurate response based on the context above. think deeply an
     } catch (error) {
       logger.error('Error in askQuestion:', error);
       throw new Error(`Failed to generate response: ${error.message}`);
+    }
+  }
+
+  async askQuestionStream(question, options = {}) {
+    const {
+      provider = null,
+      maxContextDocs = 5
+    } = options;
+
+    try {
+      return await this.generateResponseStream(question, provider, maxContextDocs);
+    } catch (error) {
+      logger.error('Error in askQuestionStream:', error);
+      throw new Error(`Failed to generate streaming response: ${error.message}`);
     }
   }
 

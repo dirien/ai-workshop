@@ -42,6 +42,95 @@ router.post('/', validateChatMessage, handleValidationErrors, async (req, res) =
   }
 });
 
+// POST /api/chat/stream - Streaming chat endpoint with SSE (Bedrock only)
+router.post('/stream', validateChatMessage, handleValidationErrors, async (req, res) => {
+  try {
+    const {
+      message,
+      provider = null, // Optional - always uses Bedrock (kept for backward compatibility)
+      maxContextDocs = 5
+    } = req.body;
+
+    logger.info(`Streaming chat request received: "${message}" using Bedrock`);
+
+    // Set SSE headers
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
+
+    // Send initial connection event
+    res.write('event: connected\n');
+    res.write('data: {"status":"connected"}\n\n');
+
+    try {
+      // Generate streaming response using RAG service with Bedrock
+      const { stream, metadata } = await ragService.askQuestionStream(message, {
+        provider: 'bedrock', // Always use Bedrock
+        maxContextDocs
+      });
+
+      // Send metadata event
+      res.write('event: metadata\n');
+      res.write(`data: ${JSON.stringify(metadata)}\n\n`);
+
+      // Stream the response chunks
+      let chunkCount = 0;
+      for await (const chunk of stream) {
+        chunkCount++;
+        
+        // Send chunk as SSE event
+        res.write('event: chunk\n');
+        res.write(`data: ${JSON.stringify({ chunk, chunkNumber: chunkCount })}\n\n`);
+
+        // Flush the response to ensure immediate delivery
+        if (res.flush) {
+          res.flush();
+        }
+      }
+
+      // Send completion event
+      res.write('event: done\n');
+      res.write(`data: ${JSON.stringify({ success: true, totalChunks: chunkCount })}\n\n`);
+      
+      logger.info(`Streaming response completed: ${chunkCount} chunks sent`);
+
+    } catch (streamError) {
+      logger.error('Error during streaming:', streamError);
+      
+      // Send error event
+      res.write('event: error\n');
+      res.write(`data: ${JSON.stringify({ 
+        error: 'Streaming failed', 
+        message: streamError.message 
+      })}\n\n`);
+    } finally {
+      // Close the connection
+      res.end();
+    }
+
+  } catch (error) {
+    logger.error('Error in streaming chat endpoint:', error);
+    
+    // If headers haven't been sent yet, send JSON error
+    if (!res.headersSent) {
+      res.status(500).json({
+        success: false,
+        error: 'Failed to initialize streaming response',
+        message: error.message
+      });
+    } else {
+      // If streaming already started, send error event
+      res.write('event: error\n');
+      res.write(`data: ${JSON.stringify({ 
+        error: 'Failed to initialize streaming', 
+        message: error.message 
+      })}\n\n`);
+      res.end();
+    }
+  }
+});
+
 // GET /api/chat/context - Get context for a question without generating response
 router.get('/context', async (req, res) => {
   try {
