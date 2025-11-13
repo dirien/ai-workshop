@@ -1,6 +1,6 @@
 import express from 'express';
 import { validateChatMessage, handleValidationErrors } from '../middleware/validation.js';
-import ragService from '../services/ragService.js';
+import ragService from '../services/ragServiceCached.js';
 import llmProvider from '../services/llmProvider.js';
 import logger from '../config/logger.js';
 import { config } from '../config/index.js';

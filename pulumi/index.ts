@@ -2,6 +2,7 @@ import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
 import * as awsx from "@pulumi/awsx";
 import * as docker from "@pulumi/docker";
+import { CacheInfrastructure } from "./cache-infrastructure";
 
 // Configuration
 const config = new pulumi.Config();
@@ -171,6 +172,19 @@ const openSearchSecurityGroup = new aws.ec2.SecurityGroup(`${appName}-opensearch
         description: "Allow all outbound traffic",
     }],
     tags: {...tags, Name: `${appName}-opensearch-sg`},
+});
+
+// =============================================================================
+// ElastiCache Redis for Multi-Layer Caching
+// =============================================================================
+
+const cacheInfra = new CacheInfrastructure(`${appName}-cache-infra`, {
+    appName,
+    environment,
+    vpcId: vpc.vpcId,
+    privateSubnetIds: vpc.privateSubnetIds,
+    ecsSecurityGroupId: ecsSecurityGroup.id,
+    tags,
 });
 
 // =============================================================================
@@ -416,7 +430,8 @@ const taskDefinition = new aws.ecs.TaskDefinition(`${appName}-task`, {
         secretsManagerSecret.arn,
         image.repoDigest,
         aws.getRegionOutput().name,
-    ]).apply(([logGroupName, opensearchEndpoint, secretArn, imageDigest, awsRegion]) => JSON.stringify([{
+        cacheInfra.primaryEndpoint,
+    ]).apply(([logGroupName, opensearchEndpoint, secretArn, imageDigest, awsRegion, redisEndpoint]) => JSON.stringify([{
         name: "app",
         image: imageDigest, // Use the built and pushed Docker image
         essential: true,
@@ -434,6 +449,13 @@ const taskDefinition = new aws.ecs.TaskDefinition(`${appName}-task`, {
             {name: "OPENSEARCH_INDEX", value: "otel_knowledge"},
             {name: "OPENSEARCH_USERNAME", value: "admin"},
             {name: "AWS_REGION", value: awsRegion},
+            // Redis Cache Configuration
+            {name: "REDIS_HOST", value: redisEndpoint},
+            {name: "REDIS_PORT", value: "6379"},
+            {name: "REDIS_ENABLED", value: "true"},
+            {name: "CACHE_TTL_RESPONSE", value: "86400"}, // 24 hours for full responses
+            {name: "CACHE_TTL_VECTOR", value: "43200"}, // 12 hours for vector search results
+            {name: "CACHE_TTL_EMBEDDING", value: "604800"}, // 7 days for embeddings
             // Honeycomb Observability Configuration
             {name: "HONEYCOMB_DATASET", value: `${appName}-${environment}`},
             {name: "OTEL_SERVICE_NAME", value: `${appName}-backend`},
@@ -505,6 +527,11 @@ export const openSearchEndpoint = openSearchDomain.endpoint;
 export const openSearchDashboard = openSearchDomain.dashboardEndpoint;
 export const ecsClusterName = cluster.name;
 export const secretsManagerSecretArn = secretsManagerSecret.arn;
+
+// Cache Infrastructure
+export const redisPrimaryEndpoint = cacheInfra.primaryEndpoint;
+export const redisReaderEndpoint = cacheInfra.readerEndpoint;
+export const redisPort = cacheInfra.port;
 
 // Useful commands (optional - automated builds handle Docker)
 export const ecrLoginCommand = pulumi.interpolate`aws ecr get-login-password --region ${aws.getRegionOutput().name} | docker login --username AWS --password-stdin ${ecrRepository.repositoryUrl}`;

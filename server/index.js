@@ -16,10 +16,13 @@ import { rateLimiter, validateApiKey, requestLogger } from './middleware/auth.js
 import chatRouter from './routes/chat.js';
 import adminRouter from './routes/admin.js';
 import ingestRouter from './routes/ingest.js';
+import cacheRouter from './routes/cache.js';
 
 // Import services to initialize them
 import llmProvider from './services/llmProvider.js';
-import vectorStore from './services/vectorStore.js';
+import vectorStore from './services/vectorStoreCached.js';
+import cacheService from './services/cacheService.js';
+import cacheMetrics from './utils/cacheMetrics.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -84,6 +87,18 @@ class Server {
         defaultProvider: config.llm.defaultProvider
       });
 
+      // Initialize cache service
+      logger.debug('Initializing cache service...');
+      // Cache service initializes automatically in constructor
+      if (cacheService.isAvailable()) {
+        logger.info('Cache service initialized and available');
+        
+        // Register observable metrics
+        cacheMetrics.registerObservables(() => cacheService.getStats());
+      } else {
+        logger.warn('Cache service not available - running without caching');
+      }
+
       // Initialize vector store
       logger.debug('Initializing vector store...');
       await vectorStore.initialize();
@@ -139,6 +154,7 @@ class Server {
     this.app.use('/api/chat', chatRouter);
     this.app.use('/api/admin', adminRouter);
     this.app.use('/api/ingest', ingestRouter);
+    this.app.use('/api/cache', cacheRouter);
 
     // Health check endpoint
     this.app.get('/api/health', (req, res) => {
