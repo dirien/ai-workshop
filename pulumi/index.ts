@@ -449,6 +449,8 @@ const taskDefinition = new aws.ecs.TaskDefinition(`${appName}-task`, {
             {name: "OTEL_SERVICE_NAME", value: `${appName}-backend`},
             {name: "OTEL_EXPORTER_OTLP_ENDPOINT", value: "https://api.honeycomb.io"},
             {name: "OTEL_EXPORTER_OTLP_PROTOCOL", value: "http/protobuf"},
+            // Enable OpenTelemetry GenAI Semantic Conventions v1.0 (stable)
+            {name: "OTEL_SEMCONV_STABILITY_OPT_IN", value: "gen_ai"},
         ],
         secrets: [
             {
@@ -495,6 +497,122 @@ const service = new aws.ecs.Service(`${appName}-service`, {
     tags: tags,
 }, {dependsOn: [listener]});
 
+// =============================================================================
+// CloudWatch Metric Streams to Honeycomb
+// =============================================================================
+
+// Create IAM role for Firehose to write to Honeycomb
+const firehoseRole = new aws.iam.Role(`${appName}-firehose-role`, {
+    assumeRolePolicy: JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [{
+            Effect: "Allow",
+            Principal: {Service: "firehose.amazonaws.com"},
+            Action: "sts:AssumeRole",
+        }],
+    }),
+    tags: tags,
+});
+
+// Create S3 bucket for failed delivery backup
+const firehoseBackupBucket = new aws.s3.Bucket(`${appName}-firehose-backup`, {
+    forceDestroy: true,
+    tags: tags,
+});
+
+// Grant Firehose permissions to write to S3 backup bucket
+const firehoseS3Policy = new aws.iam.RolePolicy(`${appName}-firehose-s3-policy`, {
+    role: firehoseRole.id,
+    policy: firehoseBackupBucket.arn.apply(bucketArn => JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [{
+            Effect: "Allow",
+            Action: [
+                "s3:AbortMultipartUpload",
+                "s3:GetBucketLocation",
+                "s3:GetObject",
+                "s3:ListBucket",
+                "s3:ListBucketMultipartUploads",
+                "s3:PutObject",
+            ],
+            Resource: [
+                bucketArn,
+                `${bucketArn}/*`,
+            ],
+        }],
+    })),
+});
+
+// Create Kinesis Firehose delivery stream to Honeycomb
+const firehoseDeliveryStream = new aws.kinesis.FirehoseDeliveryStream(`${appName}-metrics-stream`, {
+    name: `${appName}-metrics-to-honeycomb`,
+    destination: "http_endpoint",
+    httpEndpointConfiguration: {
+        url: pulumi.interpolate`https://api.honeycomb.io/1/kinesis_events/${appName}-${environment}`,
+        name: "Honeycomb",
+        accessKey: config.requireSecret("honeycombApiKey"),
+        s3BackupMode: "FailedDataOnly",
+        s3Configuration: {
+            roleArn: firehoseRole.arn,
+            bucketArn: firehoseBackupBucket.arn,
+            compressionFormat: "GZIP",
+        },
+        requestConfiguration: {
+            contentEncoding: "GZIP",
+        },
+        bufferingInterval: 60,
+        bufferingSize: 1,
+    },
+    tags: tags,
+}, {dependsOn: [firehoseS3Policy]});
+
+// Create IAM role for CloudWatch to write to Firehose
+const metricStreamRole = new aws.iam.Role(`${appName}-metric-stream-role`, {
+    assumeRolePolicy: JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [{
+            Effect: "Allow",
+            Principal: {Service: "streams.metrics.cloudwatch.amazonaws.com"},
+            Action: "sts:AssumeRole",
+        }],
+    }),
+    tags: tags,
+});
+
+// Grant CloudWatch Metric Stream permission to write to Firehose
+const metricStreamPolicy = new aws.iam.RolePolicy(`${appName}-metric-stream-policy`, {
+    role: metricStreamRole.id,
+    policy: firehoseDeliveryStream.arn.apply(firehoseArn => JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [{
+            Effect: "Allow",
+            Action: [
+                "firehose:PutRecord",
+                "firehose:PutRecordBatch",
+            ],
+            Resource: firehoseArn,
+        }],
+    })),
+});
+
+// Create CloudWatch Metric Stream to send ECS metrics to Honeycomb
+const metricStream = new aws.cloudwatch.MetricStream(`${appName}-metric-stream`, {
+    name: `${appName}-ecs-metrics`,
+    roleArn: metricStreamRole.arn,
+    firehoseArn: firehoseDeliveryStream.arn,
+    outputFormat: "opentelemetry1.0", // Use OpenTelemetry format for Honeycomb compatibility
+    includeFilters: [
+        {
+            namespace: "AWS/ECS",
+            metricNames: [],  // Empty array means include all metrics from this namespace
+        },
+        {
+            namespace: "ECS/ContainerInsights",
+            metricNames: [],
+        },
+    ],
+    tags: tags,
+}, {dependsOn: [metricStreamPolicy]});
 
 // =============================================================================
 // Outputs
@@ -519,3 +637,7 @@ export const secretsManagerSecretArn = secretsManagerSecret.arn;
 // Useful commands (optional - automated builds handle Docker)
 export const ecrLoginCommand = pulumi.interpolate`aws ecr get-login-password --region ${aws.getRegionOutput().name} | docker login --username AWS --password-stdin ${ecrRepository.repositoryUrl}`;
 export const dockerBuildCommand = pulumi.interpolate`docker build -t ${ecrRepository.repositoryUrl}:latest ../ && docker push ${ecrRepository.repositoryUrl}:latest`;
+
+// Observability
+export const metricStreamName = metricStream.name;
+export const firehoseStreamName = firehoseDeliveryStream.name;
