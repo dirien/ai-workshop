@@ -5,7 +5,8 @@ const tracer = trace.getTracer('llm-provider', '1.0.0');
 
 /**
  * Wrap an LLM call with OpenTelemetry tracing
- * Following Honeycomb LLM Observability best practices
+ * Following OpenTelemetry GenAI Semantic Conventions v1.0 (stable)
+ * Reference: https://opentelemetry.io/docs/specs/semconv/gen-ai/
  *
  * @param {string} providerName - Name of the LLM provider (openai, anthropic, bedrock)
  * @param {string} modelName - Model identifier
@@ -15,12 +16,17 @@ const tracer = trace.getTracer('llm-provider', '1.0.0');
  */
 export async function traceLLMCall(providerName, modelName, fn, metadata = {}) {
   return tracer.startActiveSpan(
-    `llm.${providerName}.call`,
+    `gen_ai.${providerName}.chat`,
     {
       attributes: {
-        'llm.provider': providerName,
-        'llm.model': modelName,
-        'llm.request_type': 'completion',
+        // REQUIRED v1.0 attributes
+        'gen_ai.operation.name': 'chat',
+        'gen_ai.system': providerName === 'bedrock' ? 'aws.bedrock' : providerName,
+        'gen_ai.request.model': modelName,
+
+        // RECOMMENDED v1.0 attributes
+        'server.address': providerName === 'bedrock' ? 'bedrock-runtime.us-east-1.amazonaws.com' : undefined,
+
         ...metadata
       }
     },
@@ -36,26 +42,26 @@ export async function traceLLMCall(providerName, modelName, fn, metadata = {}) {
         // Extract token usage if available (varies by provider)
         const usage = extractTokenUsage(result, providerName);
 
-        // Set standard LLM attributes
-        span.setAttributes({
-          'llm.duration_ms': duration,
-          'llm.response.success': true
-        });
-
-        // Add token usage attributes if available
+        // Add token usage attributes if available (RECOMMENDED in v1.0)
         if (usage) {
           span.setAttributes({
-            'llm.usage.prompt_tokens': usage.promptTokens || 0,
-            'llm.usage.completion_tokens': usage.completionTokens || 0,
-            'llm.usage.total_tokens': usage.totalTokens || 0
+            'gen_ai.usage.input_tokens': usage.promptTokens || 0,
+            'gen_ai.usage.output_tokens': usage.completionTokens || 0,
           });
         }
 
-        // Add response metadata
-        if (result.content) {
-          span.setAttributes({
-            'llm.response.length': result.content.length
-          });
+        // Add response metadata (RECOMMENDED in v1.0)
+        if (result.id) {
+          span.setAttribute('gen_ai.response.id', result.id);
+        }
+
+        if (result.model) {
+          span.setAttribute('gen_ai.response.model', result.model);
+        }
+
+        // Add finish reasons if available (RECOMMENDED in v1.0)
+        if (result.stop_reason || result.finish_reason) {
+          span.setAttribute('gen_ai.response.finish_reasons', [result.stop_reason || result.finish_reason]);
         }
 
         span.setStatus({ code: SpanStatusCode.OK });
@@ -66,18 +72,16 @@ export async function traceLLMCall(providerName, modelName, fn, metadata = {}) {
       } catch (error) {
         const duration = Date.now() - startTime;
 
-        span.setAttributes({
-          'llm.duration_ms': duration,
-          'llm.response.success': false,
-          'llm.error.type': error.name || 'Error',
-          'llm.error.message': error.message
-        });
+        // CONDITIONALLY REQUIRED: error.type when operation ends in error
+        span.setAttribute('error.type', error.name || 'GenAIError');
 
-        // Check for rate limiting
+        // Additional error context
         if (error.status === 429 || error.message?.includes('rate limit')) {
-          span.setAttributes({
-            'llm.error.rate_limited': true
-          });
+          span.setAttribute('error.type', 'RateLimitError');
+        } else if (error.message?.includes('timeout')) {
+          span.setAttribute('error.type', 'TimeoutError');
+        } else if (error.status === 400) {
+          span.setAttribute('error.type', 'InvalidRequestError');
         }
 
         span.setStatus({
@@ -144,51 +148,59 @@ function extractTokenUsage(result, providerName) {
 }
 
 /**
- * Add LLM prompt and response as span events
- * Useful for debugging but be mindful of data sensitivity
+ * Add GenAI prompt and response content as span attributes (opt-in)
+ * Following OpenTelemetry GenAI Semantic Conventions v1.0
+ * Use sparingly in production due to privacy and data volume concerns
  *
  * @param {Object} span - OpenTelemetry span
- * @param {string} prompt - User prompt
+ * @param {string} systemPrompt - System prompt/instructions
+ * @param {string} userPrompt - User message
  * @param {string} response - LLM response
  * @param {boolean} includeContent - Whether to include full content (default: false for production)
  */
-export function addLLMEvents(span, prompt, response, includeContent = false) {
+export function addGenAIContent(span, systemPrompt, userPrompt, response, includeContent = false) {
   try {
     if (includeContent) {
-      span.addEvent('llm.prompt', {
-        'llm.prompt.text': prompt,
-        'llm.prompt.length': prompt.length
-      });
+      // v1.0 OPTIONAL attributes for prompt content
+      if (systemPrompt) {
+        span.setAttribute('gen_ai.prompt.0.content', systemPrompt);
+        span.setAttribute('gen_ai.prompt.0.role', 'system');
+      }
 
-      span.addEvent('llm.response', {
-        'llm.response.text': response,
-        'llm.response.length': response.length
-      });
-    } else {
-      // In production, only log lengths for privacy
-      span.addEvent('llm.prompt', {
-        'llm.prompt.length': prompt.length
-      });
+      if (userPrompt) {
+        span.setAttribute('gen_ai.prompt.1.content', userPrompt);
+        span.setAttribute('gen_ai.prompt.1.role', 'user');
+      }
 
-      span.addEvent('llm.response', {
-        'llm.response.length': response.length
-      });
+      if (response) {
+        span.setAttribute('gen_ai.completion.0.content', response);
+        span.setAttribute('gen_ai.completion.0.role', 'assistant');
+      }
     }
+
+    // Always capture content lengths for analysis (no privacy concerns)
+    if (systemPrompt) span.setAttribute('gen_ai.prompt.0.length', systemPrompt.length);
+    if (userPrompt) span.setAttribute('gen_ai.prompt.1.length', userPrompt.length);
+    if (response) span.setAttribute('gen_ai.completion.0.length', response.length);
+
   } catch (error) {
-    logger.debug('Error adding LLM events:', error);
+    logger.debug('Error adding GenAI content attributes:', error);
   }
 }
 
 /**
  * Create a span for embedding generation
+ * Following OpenTelemetry GenAI Semantic Conventions v1.0
  */
-export async function traceEmbeddingGeneration(providerName, fn, metadata = {}) {
+export async function traceEmbeddingGeneration(providerName, modelName, fn, metadata = {}) {
   return tracer.startActiveSpan(
-    `llm.${providerName}.embedding`,
+    `gen_ai.${providerName}.embeddings`,
     {
       attributes: {
-        'llm.provider': providerName,
-        'llm.request_type': 'embedding',
+        // REQUIRED v1.0 attributes
+        'gen_ai.operation.name': 'embeddings',
+        'gen_ai.system': providerName === 'bedrock' ? 'aws.bedrock' : providerName,
+        'gen_ai.request.model': modelName,
         ...metadata
       }
     },
@@ -199,13 +211,13 @@ export async function traceEmbeddingGeneration(providerName, fn, metadata = {}) 
         const result = await fn();
         const duration = Date.now() - startTime;
 
-        span.setAttributes({
-          'llm.duration_ms': duration,
-          'llm.response.success': true
-        });
-
+        // Count embeddings generated
         if (Array.isArray(result)) {
-          span.setAttribute('llm.embedding.count', result.length);
+          span.setAttribute('gen_ai.usage.output_tokens', result.length);
+        }
+
+        if (result.id) {
+          span.setAttribute('gen_ai.response.id', result.id);
         }
 
         span.setStatus({ code: SpanStatusCode.OK });
@@ -216,11 +228,8 @@ export async function traceEmbeddingGeneration(providerName, fn, metadata = {}) 
       } catch (error) {
         const duration = Date.now() - startTime;
 
-        span.setAttributes({
-          'llm.duration_ms': duration,
-          'llm.response.success': false,
-          'llm.error.message': error.message
-        });
+        // CONDITIONALLY REQUIRED: error.type
+        span.setAttribute('error.type', error.name || 'GenAIError');
 
         span.setStatus({
           code: SpanStatusCode.ERROR,
@@ -237,6 +246,6 @@ export async function traceEmbeddingGeneration(providerName, fn, metadata = {}) 
 
 export default {
   traceLLMCall,
-  addLLMEvents,
+  addGenAIContent,
   traceEmbeddingGeneration
 };
