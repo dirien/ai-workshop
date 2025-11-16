@@ -5,7 +5,7 @@ import { trace, context, SpanStatusCode } from '@opentelemetry/api';
 import llmProvider from './llmProvider.js';
 import vectorStore from './vectorStore.js';
 import logger from '../config/logger.js';
-import { traceLLMCall, addLLMEvents } from '../utils/llmTracing.js';
+import { traceLLMCall, addGenAIContent } from '../utils/llmTracing.js';
 
 const tracer = trace.getTracer('rag-service', '1.0.0');
 
@@ -103,7 +103,7 @@ Provide a helpful, accurate response based on the context above. think deeply an
         });
 
         // Vector search with tracing
-        const relevantDocs = await tracer.startActiveSpan('rag.vector_search', async (vectorSpan) => {
+        const relevantDocs = await tracer.startActiveSpan('db.vector.search', async (vectorSpan) => {
           const vectorStartTime = Date.now();
 
           try {
@@ -113,19 +113,34 @@ Provide a helpful, accurate response based on the context above. think deeply an
             // Calculate relevance scores
             const scores = results.map(([, score]) => score);
             const avgScore = scores.reduce((a, b) => a + b, 0) / scores.length;
+            const maxScore = Math.max(...scores);
+            const minScore = Math.min(...scores);
 
             vectorSpan.setAttributes({
-              'rag.vector_search.duration_ms': duration,
-              'rag.vector_search.results_count': results.length,
-              'rag.vector_search.max_score': Math.max(...scores),
-              'rag.vector_search.min_score': Math.min(...scores),
-              'rag.vector_search.avg_score': avgScore
+              // Database semantic conventions
+              'db.system': 'opensearch',
+              'db.operation': 'vector_search',
+              'db.namespace': process.env.OPENSEARCH_INDEX || 'otel_knowledge',
+
+              // RAG-specific attributes
+              'rag.query': question,
+              'rag.query_length': question.length,
+              'rag.documents_retrieved': results.length,
+              'rag.retrieval_latency_ms': duration,
+              'rag.k': maxContextDocs,  // Top-K requested
+
+              // Similarity/relevance metrics
+              'rag.similarity.max': maxScore,
+              'rag.similarity.min': minScore,
+              'rag.similarity.avg': avgScore,
+              'rag.similarity.threshold': minScore  // Documents below this weren't returned
             });
 
             vectorSpan.setStatus({ code: SpanStatusCode.OK });
             vectorSpan.end();
             return results;
           } catch (error) {
+            vectorSpan.setAttribute('error.type', error.name || 'VectorSearchError');
             vectorSpan.setStatus({
               code: SpanStatusCode.ERROR,
               message: error.message
