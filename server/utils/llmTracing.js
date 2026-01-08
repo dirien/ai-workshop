@@ -16,16 +16,16 @@ const tracer = trace.getTracer('llm-provider', '1.0.0');
  */
 export async function traceLLMCall(providerName, modelName, fn, metadata = {}) {
   return tracer.startActiveSpan(
-    `gen_ai.${providerName}.chat`,
+    `chat ${modelName}`,
     {
       attributes: {
         // REQUIRED v1.0 attributes
         'gen_ai.operation.name': 'chat',
-        'gen_ai.system': providerName === 'bedrock' ? 'aws.bedrock' : providerName,
+        'gen_ai.provider.name': providerName === 'bedrock' ? 'aws.bedrock' : providerName,
         'gen_ai.request.model': modelName,
 
         // RECOMMENDED v1.0 attributes
-        'server.address': providerName === 'bedrock' ? 'bedrock-runtime.us-east-1.amazonaws.com' : undefined,
+        'server.address': providerName === 'bedrock' ? `bedrock-runtime.${process.env.AWS_REGION || 'us-east-1'}.amazonaws.com` : undefined,
 
         ...metadata
       }
@@ -194,12 +194,12 @@ export function addGenAIContent(span, systemPrompt, userPrompt, response, includ
  */
 export async function traceEmbeddingGeneration(providerName, modelName, fn, metadata = {}) {
   return tracer.startActiveSpan(
-    `gen_ai.${providerName}.embeddings`,
+    `embeddings ${modelName}`,
     {
       attributes: {
         // REQUIRED v1.0 attributes
         'gen_ai.operation.name': 'embeddings',
-        'gen_ai.system': providerName === 'bedrock' ? 'aws.bedrock' : providerName,
+        'gen_ai.provider.name': providerName === 'bedrock' ? 'aws.bedrock' : providerName,
         'gen_ai.request.model': modelName,
         ...metadata
       }
@@ -211,9 +211,13 @@ export async function traceEmbeddingGeneration(providerName, modelName, fn, meta
         const result = await fn();
         const duration = Date.now() - startTime;
 
-        // Count embeddings generated
-        if (Array.isArray(result)) {
-          span.setAttribute('gen_ai.usage.output_tokens', result.length);
+        // Track embedding dimensions (RECOMMENDED in v1.0)
+        if (Array.isArray(result) && result.length > 0) {
+          // If result is an array of embeddings, count the vector dimensions
+          const firstEmbedding = Array.isArray(result[0]) ? result[0] : result;
+          if (Array.isArray(firstEmbedding)) {
+            span.setAttribute('gen_ai.embeddings.dimension.count', firstEmbedding.length);
+          }
         }
 
         if (result.id) {
