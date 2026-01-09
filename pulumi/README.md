@@ -215,6 +215,36 @@ pulumi stack output openSearchDashboard
 
 3. Check ECS task IAM permissions
 
+### Bedrock Model Access Denied
+
+If you see an error like:
+```
+Model access is denied due to IAM user or service role is not authorized to perform
+the required AWS Marketplace actions (aws-marketplace:ViewSubscriptions, aws-marketplace:Subscribe)
+```
+
+The ECS task role needs AWS Marketplace permissions to access Claude models through Bedrock. The infrastructure code includes these permissions. If you recently updated the IAM policy, wait 5 minutes for changes to propagate, or force a new ECS deployment:
+
+```bash
+aws ecs update-service --cluster <cluster-name> --service <service-name> --force-new-deployment
+```
+
+### OpenSearch Service Linked Role Already Exists
+
+If you see an error like:
+```
+Service role name AWSServiceRoleForAmazonElasticsearchService has been taken in this account
+```
+
+This means the OpenSearch Service Linked Role already exists in your AWS account. Import it into Pulumi state:
+
+```bash
+pulumi import aws:iam/serviceLinkedRole:ServiceLinkedRole opensearch-service-linked-role \
+  arn:aws:iam::<account-id>:role/aws-service-role/es.amazonaws.com/AWSServiceRoleForAmazonElasticsearchService
+```
+
+Replace `<account-id>` with your AWS account ID.
+
 ### OpenSearch Connection Issues
 
 1. Verify security group allows traffic from ECS

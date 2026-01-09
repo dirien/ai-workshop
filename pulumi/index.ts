@@ -256,6 +256,10 @@ const secretsPolicy = new aws.iam.RolePolicy(`${appName}-secrets-policy`, {
 // OpenSearch Domain
 // =============================================================================
 
+// OpenSearch Service Linked Role
+// Note: This role is a singleton per AWS account. If you get an error that the role
+// already exists, you can import it with:
+// pulumi import aws:iam/serviceLinkedRole:ServiceLinkedRole opensearch-service-linked-role arn:aws:iam::<account-id>:role/aws-service-role/es.amazonaws.com/AWSServiceRoleForAmazonElasticsearchService
 const opensearchSlr = new aws.iam.ServiceLinkedRole("opensearch-service-linked-role", {
     awsServiceName: "es.amazonaws.com"
 });
@@ -345,6 +349,14 @@ const bedrockPolicy = new aws.iam.RolePolicy(`${appName}-bedrock-policy`, {
                     "arn:aws:bedrock:*::foundation-model/*",
                     "arn:aws:bedrock:*:${aws.getCallerIdentityOutput().accountId}:inference-profile/*"
                 ]
+            },
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "aws-marketplace:ViewSubscriptions",
+                    "aws-marketplace:Subscribe"
+                ],
+                "Resource": "*"
             }
         ]
     }`,
