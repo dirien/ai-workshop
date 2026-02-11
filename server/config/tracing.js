@@ -10,19 +10,25 @@ import { diag, DiagConsoleLogger, DiagLogLevel } from '@opentelemetry/api';
 // Note: DO NOT import logger here - Winston must be imported AFTER instrumentation is set up
 
 /**
- * Initialize OpenTelemetry tracing and logging with Honeycomb
+ * Initialize OpenTelemetry tracing and logging
  * This must be called before any other imports to ensure proper instrumentation
+ *
+ * Architecture: App → ADOT collector sidecar (localhost:4318) → Honeycomb + AWS X-Ray
+ * The ADOT collector handles authentication for both backends (Honeycomb API key
+ * and SigV4 for X-Ray), so the app only needs to send plain OTLP to localhost.
  *
  * Logs are sent to both:
  * - CloudWatch: Via console output captured by ECS
- * - Honeycomb: Via OpenTelemetry OTLP exporter
+ * - Honeycomb: Via ADOT collector → OTLP
+ *
+ * Traces are sent to both:
+ * - Honeycomb: Via ADOT collector → OTLP
+ * - AWS X-Ray: Via ADOT collector → OTLP with SigV4 auth
  *
  * Configuration via environment variables:
  * - OTEL_SERVICE_NAME: Service name for traces and logs
- * - OTEL_EXPORTER_OTLP_ENDPOINT: OTLP endpoint (e.g., https://api.honeycomb.io)
- * - OTEL_EXPORTER_OTLP_HEADERS: OTLP headers (e.g., x-honeycomb-team=<api-key>)
+ * - OTEL_EXPORTER_OTLP_ENDPOINT: OTLP endpoint (http://localhost:4318 in ECS)
  * - OTEL_EXPORTER_OTLP_PROTOCOL: Protocol to use (http/protobuf)
- * - HONEYCOMB_API_KEY: API key for authentication (optional, if not using headers)
  */
 export function initializeTracing() {
   try {
