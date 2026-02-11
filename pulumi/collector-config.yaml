@@ -1,0 +1,39 @@
+# ADOT Collector configuration for dual-send: Honeycomb + AWS X-Ray
+# Deployed as an ECS sidecar container. The app sends OTLP to localhost:4318,
+# and this collector fans out to both backends with appropriate auth on each.
+
+extensions:
+  sigv4auth:
+    region: us-east-1
+    service: xray
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+exporters:
+  otlphttp/honeycomb:
+    endpoint: https://api.honeycomb.io
+    headers:
+      x-honeycomb-team: ${env:HONEYCOMB_API_KEY}
+
+  otlphttp/xray:
+    endpoint: https://xray.us-east-1.amazonaws.com
+    auth:
+      authenticator: sigv4auth
+
+service:
+  extensions: [sigv4auth, health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [otlphttp/honeycomb, otlphttp/xray]
+    logs:
+      receivers: [otlp]
+      exporters: [otlphttp/honeycomb]

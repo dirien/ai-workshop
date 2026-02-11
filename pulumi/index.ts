@@ -2,6 +2,10 @@ import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
 import * as awsx from "@pulumi/awsx";
 import * as dockerBuild from "@pulumi/docker-build";
+import * as fs from "fs";
+
+// ADOT collector config — kept as a separate YAML file to avoid escaping pain
+const collectorConfigYaml = fs.readFileSync("collector-config.yaml", "utf-8");
 
 // Configuration
 const config = new pulumi.Config();
@@ -230,7 +234,6 @@ const secretVersion = new aws.secretsmanager.SecretVersion(`${appName}-secrets-v
         const secretObj = {
             OPENSEARCH_PASSWORD: opensearchPassword,
             HONEYCOMB_API_KEY: honeycombApiKey,
-            OTEL_EXPORTER_OTLP_HEADERS: `x-honeycomb-team=${honeycombApiKey}`,
         };
         return JSON.stringify(secretObj);
     }),
@@ -362,6 +365,24 @@ const bedrockPolicy = new aws.iam.RolePolicy(`${appName}-bedrock-policy`, {
     }`,
 });
 
+// Grant ECS task access to AWS X-Ray (used by ADOT collector sidecar for SigV4 auth)
+const xrayPolicy = new aws.iam.RolePolicy(`${appName}-xray-policy`, {
+    role: ecsTaskRole.id,
+    policy: JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [{
+            Effect: "Allow",
+            Action: [
+                "xray:PutTraceSegments",
+                "xray:PutTelemetryRecords",
+                "xray:GetSamplingRules",
+                "xray:GetSamplingTargets",
+            ],
+            Resource: "*",
+        }],
+    }),
+});
+
 // =============================================================================
 // Application Load Balancer
 // =============================================================================
@@ -422,8 +443,8 @@ const logGroup = new aws.cloudwatch.LogGroup(`${appName}-logs`, {
 // ECS Task Definition
 const taskDefinition = new aws.ecs.TaskDefinition(`${appName}-task`, {
     family: `${appName}-app`,
-    cpu: "512",
-    memory: "1024",
+    cpu: "1024",
+    memory: "2048",
     networkMode: "awsvpc",
     requiresCompatibilities: ["FARGATE"],
     runtimePlatform: {
@@ -438,55 +459,87 @@ const taskDefinition = new aws.ecs.TaskDefinition(`${appName}-task`, {
         secretsManagerSecret.arn,
         image.ref,
         aws.getRegionOutput().name,
-    ]).apply(([logGroupName, opensearchEndpoint, secretArn, imageDigest, awsRegion]) => JSON.stringify([{
-        name: "app",
-        image: imageDigest, // Use the built and pushed Docker image
-        essential: true,
-        portMappings: [{
-            containerPort: 3001,
-            protocol: "tcp",
-        }],
-        environment: [
-            {name: "PORT", value: "3001"},
-            {name: "NODE_ENV", value: nodeEnv},
-            {name: "LOG_LEVEL", value: "debug"}, // Set to "debug" for verbose logging, "info" for production
-            {name: "DEFAULT_LLM_PROVIDER", value: "bedrock"},
-            {name: "BEDROCK_MODEL", value: "anthropic.claude-3-5-sonnet-20240620-v1:0"},
-            {name: "OPENSEARCH_ENDPOINT", value: `https://${opensearchEndpoint}`},
-            {name: "OPENSEARCH_INDEX", value: "otel_knowledge"},
-            {name: "OPENSEARCH_USERNAME", value: "admin"},
-            {name: "AWS_REGION", value: awsRegion},
-            // Honeycomb Observability Configuration
-            {name: "HONEYCOMB_DATASET", value: `${appName}-${environment}`},
-            {name: "OTEL_SERVICE_NAME", value: `${appName}-backend`},
-            {name: "OTEL_EXPORTER_OTLP_ENDPOINT", value: "https://api.honeycomb.io"},
-            {name: "OTEL_EXPORTER_OTLP_PROTOCOL", value: "http/protobuf"},
-            // Enable OpenTelemetry GenAI Semantic Conventions v1.0 (stable)
-            {name: "OTEL_SEMCONV_STABILITY_OPT_IN", value: "gen_ai"},
-        ],
-        secrets: [
-            {
-                name: "OPENSEARCH_PASSWORD",
-                valueFrom: `${secretArn}:OPENSEARCH_PASSWORD::`,
-            },
-            {
-                name: "HONEYCOMB_API_KEY",
-                valueFrom: `${secretArn}:HONEYCOMB_API_KEY::`,
-            },
-            {
-                name: "OTEL_EXPORTER_OTLP_HEADERS",
-                valueFrom: `${secretArn}:OTEL_EXPORTER_OTLP_HEADERS::`,
-            },
-        ],
-        logConfiguration: {
-            logDriver: "awslogs",
-            options: {
-                "awslogs-group": logGroupName,
-                "awslogs-region": awsRegion,
-                "awslogs-stream-prefix": "app",
+    ]).apply(([logGroupName, opensearchEndpoint, secretArn, imageDigest, awsRegion]) => JSON.stringify([
+        // Application container
+        {
+            name: "app",
+            image: imageDigest, // Use the built and pushed Docker image
+            essential: true,
+            portMappings: [{
+                containerPort: 3001,
+                protocol: "tcp",
+            }],
+            environment: [
+                {name: "PORT", value: "3001"},
+                {name: "NODE_ENV", value: nodeEnv},
+                {name: "LOG_LEVEL", value: "debug"}, // Set to "debug" for verbose logging, "info" for production
+                {name: "DEFAULT_LLM_PROVIDER", value: "bedrock"},
+                {name: "BEDROCK_MODEL", value: "anthropic.claude-3-5-sonnet-20240620-v1:0"},
+                {name: "OPENSEARCH_ENDPOINT", value: `https://${opensearchEndpoint}`},
+                {name: "OPENSEARCH_INDEX", value: "otel_knowledge"},
+                {name: "OPENSEARCH_USERNAME", value: "admin"},
+                {name: "AWS_REGION", value: awsRegion},
+                // Honeycomb Observability Configuration
+                {name: "HONEYCOMB_DATASET", value: `${appName}-${environment}`},
+                {name: "OTEL_SERVICE_NAME", value: `${appName}-backend`},
+                // Send OTLP to the ADOT collector sidecar, which fans out to Honeycomb + X-Ray
+                {name: "OTEL_EXPORTER_OTLP_ENDPOINT", value: "http://localhost:4318"},
+                {name: "OTEL_EXPORTER_OTLP_PROTOCOL", value: "http/protobuf"},
+                // Enable OpenTelemetry GenAI Semantic Conventions v1.0 (stable)
+                {name: "OTEL_SEMCONV_STABILITY_OPT_IN", value: "gen_ai"},
+            ],
+            secrets: [
+                {
+                    name: "OPENSEARCH_PASSWORD",
+                    valueFrom: `${secretArn}:OPENSEARCH_PASSWORD::`,
+                },
+            ],
+            logConfiguration: {
+                logDriver: "awslogs",
+                options: {
+                    "awslogs-group": logGroupName,
+                    "awslogs-region": awsRegion,
+                    "awslogs-stream-prefix": "app",
+                },
             },
         },
-    }])),
+        // ADOT (AWS Distro for OpenTelemetry) collector sidecar
+        // Receives OTLP from the app and exports to Honeycomb + X-Ray
+        {
+            name: "adot-collector",
+            image: "public.ecr.aws/aws-observability/aws-otel-collector:latest",
+            essential: false, // Don't kill the task if collector crashes (workshop setting)
+            portMappings: [
+                {containerPort: 4317, protocol: "tcp"},
+                {containerPort: 4318, protocol: "tcp"},
+                {containerPort: 13133, protocol: "tcp"},
+            ],
+            environment: [
+                {name: "AOT_CONFIG_CONTENT", value: collectorConfigYaml},
+            ],
+            secrets: [
+                {
+                    name: "HONEYCOMB_API_KEY",
+                    valueFrom: `${secretArn}:HONEYCOMB_API_KEY::`,
+                },
+            ],
+            healthCheck: {
+                command: ["CMD", "/healthcheck"],
+                interval: 30,
+                timeout: 5,
+                retries: 3,
+                startPeriod: 15,
+            },
+            logConfiguration: {
+                logDriver: "awslogs",
+                options: {
+                    "awslogs-group": logGroupName,
+                    "awslogs-region": awsRegion,
+                    "awslogs-stream-prefix": "adot",
+                },
+            },
+        },
+    ])),
     tags: tags,
 });
 
